@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 
-# allow running directly
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -12,7 +11,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, classification_report
 import numpy as np
 
 import modules.config as config
@@ -21,94 +19,142 @@ from modules.training.squats.model import TwoStreamSquatClassifier
 
 
 class SquatTrainer:
-    def __init__(self,
-                 data_dir=config.DATA_DIR,
-                 num_frames=40,
-                 img_size=config.IMG_SIZE,
-                 batch_size=4,
-                 num_epochs=65,
-                 learning_rate=0.001,
-                 device=None):
-
-        self.data_dir = str(data_dir)
-        self.num_frames = num_frames
-        self.img_size = img_size
-        self.batch_size = batch_size
-        self.num_epochs = num_epochs
-        self.learning_rate = learning_rate
-
-        # device
+    def __init__(self, hyperparams=None, device=None):
+        """
+        Args:
+            hyperparams: SquatHyperparameters instance (uses default if None)
+            device: torch device (auto-detects if None)
+        """
+        self.hp = hyperparams if hyperparams is not None else config.SQUAT_HP
+        
+        # Device setup
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        print(f"Using device: {self.device}")
+        print(f"🖥️  Device: {self.device}")
         if self.device.type == "cuda":
-            print("Using CUDA device:", torch.cuda.get_device_name(0))
+            print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
 
-        # outputs
+        # Create output directories
         config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
         config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
         config.EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
-        # dataset
-        full_dataset = SquatDataset(
-            root_dir=self.data_dir,
-            num_frames=num_frames,
-            img_size=img_size
-        )
+        # Print hyperparameters
+        self.hp.print_summary()
 
-        # deterministic split (نفس المنطق 80/20 بس مع seed ثابت)
-        g = torch.Generator().manual_seed(config.SEED)
-        train_size = int(config.TRAIN_SPLIT * len(full_dataset))
-        val_size = len(full_dataset) - train_size
+        # Setup datasets
+        self._setup_datasets()
+        
+        # Setup model
+        self.model = TwoStreamSquatClassifier(self.hp).to(self.device)
+        print(f"\n🏗️  Model Parameters: {self.model.get_num_params():,}")
 
-        self.train_dataset, self.val_dataset = random_split(
-            full_dataset, [train_size, val_size], generator=g
-        )
+        # Setup training components
+        self._setup_training()
 
-        print(f"Train samples: {len(self.train_dataset)}")
-        print(f"Validation samples: {len(self.val_dataset)}")
-
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=(self.device.type == "cuda")
-        )
-
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=(self.device.type == "cuda")
-        )
-
-        self.model = TwoStreamSquatClassifier(num_classes=4).to(self.device)
-
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=5, factor=0.5
-        )
-
+        # Tracking
         self.train_losses = []
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
-
         self.best_val_acc = 0.0
-        self.classes = ["correct", "fast", "uncomplete", "wrong_position"]  
+
+    def _setup_datasets(self):
+        """Setup train and validation datasets"""
+        full_dataset = SquatDataset(
+            root_dir=config.DATA_DIR,
+            hyperparams=self.hp,
+            split='train'
+        )
+
+        # Deterministic split
+        g = torch.Generator().manual_seed(config.SEED)
+        train_size = int(config.TRAIN_SPLIT * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+
+        train_ds, val_ds = random_split(
+            full_dataset, [train_size, val_size], generator=g
+        )
+
+        # Update val dataset to use val transforms (no augmentation)
+        val_dataset_proper = SquatDataset(
+            root_dir=config.DATA_DIR,
+            hyperparams=self.hp,
+            split='val'
+        )
+        # Copy the indices from val_ds
+        val_dataset_proper.video_paths = [full_dataset.video_paths[i] for i in val_ds.indices]
+        val_dataset_proper.labels = [full_dataset.labels[i] for i in val_ds.indices]
+
+        print(f"\n📊 Dataset Split:")
+        print(f"   Train: {len(train_ds)} samples")
+        print(f"   Val:   {len(val_dataset_proper)} samples")
+
+        # Setup data loaders
+        num_workers = 2 if self.device.type == "cuda" else 0
+        
+        self.train_loader = DataLoader(
+            train_ds,
+            batch_size=self.hp.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=(self.device.type == "cuda")
+        )
+
+        self.val_loader = DataLoader(
+            val_dataset_proper,
+            batch_size=self.hp.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=(self.device.type == "cuda")
+        )
+
+    def _setup_training(self):
+        """Setup loss, optimizer, and scheduler"""
+        self.criterion = nn.CrossEntropyLoss()
+        
+        # Optimizer selection
+        if self.hp.optimizer_type.lower() == "adam":
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                lr=self.hp.learning_rate,
+                weight_decay=self.hp.weight_decay
+            )
+        elif self.hp.optimizer_type.lower() == "adamw":
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=self.hp.learning_rate,
+                weight_decay=self.hp.weight_decay
+            )
+        elif self.hp.optimizer_type.lower() == "sgd":
+            self.optimizer = optim.SGD(
+                self.model.parameters(),
+                lr=self.hp.learning_rate,
+                momentum=0.9,
+                weight_decay=self.hp.weight_decay
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {self.hp.optimizer_type}")
+        
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            patience=self.hp.scheduler_patience,
+            factor=self.hp.scheduler_factor,
+            min_lr=self.hp.scheduler_min_lr
+        )
 
     def train_epoch(self):
+        """Train for one epoch"""
         self.model.train()
         running_loss = 0.0
         correct = 0
         total = 0
 
-        pbar = tqdm(self.train_loader, desc='Training')
+        pbar = tqdm(self.train_loader, desc='Training', ncols=100)
         for batch in pbar:
             original = batch['original'].to(self.device)
             mediapipe = batch['mediapipe'].to(self.device)
@@ -128,14 +174,16 @@ class SquatTrainer:
 
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'acc': f'{100 * correct / max(1,total):.2f}%'
+                'acc': f'{100 * correct / max(1, total):.2f}%'
             })
 
-        epoch_loss = running_loss / max(1, len(self.train_loader))
-        epoch_acc = 100 * correct / max(1, total)
+        epoch_loss = running_loss / len(self.train_loader)
+        epoch_acc = 100 * correct / total
         return epoch_loss, epoch_acc
 
+    @torch.no_grad()
     def validate(self):
+        """Validate the model"""
         self.model.eval()
         running_loss = 0.0
         correct = 0
@@ -144,117 +192,133 @@ class SquatTrainer:
         all_preds = []
         all_labels = []
 
-        with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc='Validation')
-            for batch in pbar:
-                original = batch['original'].to(self.device)
-                mediapipe = batch['mediapipe'].to(self.device)
-                labels = batch['label'].to(self.device)
+        pbar = tqdm(self.val_loader, desc='Validation', ncols=100)
+        for batch in pbar:
+            original = batch['original'].to(self.device)
+            mediapipe = batch['mediapipe'].to(self.device)
+            labels = batch['label'].to(self.device)
 
-                outputs = self.model(original, mediapipe)
-                loss = self.criterion(outputs, labels)
+            outputs = self.model(original, mediapipe)
+            loss = self.criterion(outputs, labels)
 
-                running_loss += loss.item()
-                _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
 
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'acc': f'{100 * correct / max(1,total):.2f}%'
-                })
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100 * correct / max(1, total):.2f}%'
+            })
 
-        epoch_loss = running_loss / max(1, len(self.val_loader))
-        epoch_acc = 100 * correct / max(1, total)
+        epoch_loss = running_loss / len(self.val_loader)
+        epoch_acc = 100 * correct / total
         return epoch_loss, epoch_acc, all_preds, all_labels
 
     def plot_training_history(self):
-        # save next to model (outputs/models)
-        loss_path = config.MODELS_DIR / f"squats_training_loss.png"
-        acc_path  = config.MODELS_DIR / f"squats_training_acc.png"
+        """Plot and save training curves"""
+        loss_path = config.MODELS_DIR / "squats_training_loss.png"
+        acc_path = config.MODELS_DIR / "squats_training_acc.png"
 
-        plt.figure(figsize=(8, 5))
-        plt.plot(self.train_losses, label='Train Loss')
-        plt.plot(self.val_losses, label='Val Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Squats - Training/Validation Loss')
-        plt.legend()
-        plt.grid(True)
+        # Loss plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_losses, label='Train Loss', linewidth=2)
+        plt.plot(self.val_losses, label='Val Loss', linewidth=2)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.title('Squats - Training/Validation Loss', fontsize=14)
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(loss_path)
+        plt.savefig(loss_path, dpi=150)
         plt.close()
-        print(f"✓ Training loss plot saved -> {loss_path}")
+        print(f"✅ Loss plot saved: {loss_path}")
 
-        plt.figure(figsize=(8, 5))
-        plt.plot(self.train_accs, label='Train Acc')
-        plt.plot(self.val_accs, label='Val Acc')
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy (%)')
-        plt.title('Squats - Training/Validation Accuracy')
-        plt.legend()
-        plt.grid(True)
+        # Accuracy plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_accs, label='Train Acc', linewidth=2)
+        plt.plot(self.val_accs, label='Val Acc', linewidth=2)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Accuracy (%)', fontsize=12)
+        plt.title('Squats - Training/Validation Accuracy', fontsize=14)
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(acc_path)
+        plt.savefig(acc_path, dpi=150)
         plt.close()
-        print(f"✓ Training acc plot saved -> {acc_path}")
+        print(f"✅ Accuracy plot saved: {acc_path}")
 
     def train(self):
-        print("\n" + "="*50)
-        print("Starting Training")
-        print("="*50 + "\n")
+        """Main training loop"""
+        print("\n" + "=" * 70)
+        print("🚀 STARTING TRAINING")
+        print("=" * 70 + "\n")
 
-        for epoch in range(self.num_epochs):
-            print(f"\nEpoch {epoch+1}/{self.num_epochs}")
-            print("-" * 50)
+        for epoch in range(self.hp.num_epochs):
+            print(f"\n📅 Epoch {epoch + 1}/{self.hp.num_epochs}")
+            print("-" * 70)
 
+            # Train
             train_loss, train_acc = self.train_epoch()
             self.train_losses.append(train_loss)
             self.train_accs.append(train_acc)
 
+            # Validate
             val_loss, val_acc, _, _ = self.validate()
             self.val_losses.append(val_loss)
             self.val_accs.append(val_acc)
 
+            # Update scheduler
             self.scheduler.step(val_loss)
+            current_lr = self.optimizer.param_groups[0]['lr']
 
-            print(f"\nTrain Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.2f}%")
+            # Print summary
+            print(f"\n📊 Epoch Summary:")
+            print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+            print(f"   Learning Rate: {current_lr:.6f}")
 
+            # Save best model
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
-                torch.save({
+                checkpoint = {
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'val_acc': val_acc,
-                    'class_names': self.classes,
-                    'num_frames': self.num_frames,
-                    'img_size': self.img_size,
-                    'exercise': "squats",
-                    'arch': "twostream_resnet18_bilstm",
-                }, config.SQUATS_MODEL)
-                print(f"✓ Best model saved -> {config.SQUATS_MODEL} (Val Acc: {val_acc:.2f}%)")
+                    'hyperparameters': self.hp,
+                    'class_names': self.hp.class_names,
+                }
+                torch.save(checkpoint, config.SQUATS_MODEL)
+                print(f"   ✅ Best model saved! (Val Acc: {val_acc:.2f}%)")
 
-        print("\n" + "="*50)
-        print("Training Completed!")
-        print(f"Best Validation Accuracy: {self.best_val_acc:.2f}%")
-        print("="*50 + "\n")
+        print("\n" + "=" * 70)
+        print("🎉 TRAINING COMPLETED!")
+        print(f"🏆 Best Validation Accuracy: {self.best_val_acc:.2f}%")
+        print("=" * 70 + "\n")
 
         self.plot_training_history()
 
 
-if __name__ == '__main__':
-    trainer = SquatTrainer(
-        data_dir=config.DATA_DIR,
-        num_frames=40,
-        img_size=config.IMG_SIZE,
-        batch_size=4,
-        num_epochs=65,
-        learning_rate=0.001,
-        device=None
-    )
+def main():
+    """Main entry point"""
+    # You can customize hyperparameters here
+    hp = config.SQUAT_HP  # Use default
+    
+    # Or create custom hyperparameters:
+    # from modules.config import SquatHyperparameters
+    # hp = SquatHyperparameters(
+    #     batch_size=8,
+    #     num_epochs=50,
+    #     learning_rate=0.0005,
+    # )
+    
+    trainer = SquatTrainer(hyperparams=hp)
     trainer.train()
+
+
+if __name__ == '__main__':
+    main()
