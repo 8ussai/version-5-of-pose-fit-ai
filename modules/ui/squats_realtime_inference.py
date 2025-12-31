@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import time
 import cv2
 import torch
@@ -5,23 +12,22 @@ import numpy as np
 import mediapipe as mp
 from torchvision import transforms
 
-from model import TwoStreamSquatClassifier
+import modules.config as config
+from modules.training.squats.model import TwoStreamSquatClassifier
 
 
 # =========================
-# CONFIG
+# CONFIG (from config.py)
 # =========================
-MODEL_PATH = "best_model.pth"
-NUM_FRAMES = 16
-IMG_SIZE = 224
+MODEL_PATH = str(config.SQUATS_MODEL)
+NUM_FRAMES = 40
+IMG_SIZE = config.IMG_SIZE
 
 WINDOW_NAME = "Squat - One Rep Judge (Real Time)"
 
-# Calibration
 CALIB_SECONDS = 5.0
 CALIB_MIN_SAMPLES = 15
 
-# Offsets relative to standing hip_y  (تعديل مهم)
 UP_OFFSET = 0.02
 DOWN_OFFSET = 0.08
 
@@ -57,14 +63,12 @@ def safe_load_state_dict(model, checkpoint, device):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load model
     model = TwoStreamSquatClassifier(num_classes=4).to(device)
     ckpt = torch.load(MODEL_PATH, map_location=device)
     safe_load_state_dict(model, ckpt, device)
     print("✅ Model loaded:", MODEL_PATH)
     print("✅ Device:", device)
 
-    # MediaPipe
     mp_pose = mp.solutions.pose
     mp_draw = mp.solutions.drawing_utils
     pose = mp_pose.Pose(
@@ -74,7 +78,6 @@ def main():
         min_tracking_confidence=0.5
     )
 
-    # Transform
     transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -85,7 +88,6 @@ def main():
         )
     ])
 
-    # Camera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("❌ Could not open webcam. Try changing camera index (0/1/2).")
@@ -93,28 +95,22 @@ def main():
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
 
-    # Rep state machine
-    state = "CALIBRATING"  # CALIBRATING -> READY -> RECORDING -> DONE
+    state = "CALIBRATING"
     rep_frames_rgb = []
-
-    # threshold crossing flags (التعديل الرئيسي)
     went_down = False
     went_up = False
 
-    # result hold
     last_result = None
     last_result_time = 0.0
 
-    # Calibration buffers
     calib_start = time.time()
     calib_hips = []
 
-    # Dynamic thresholds
     stand_hip = None
     UP_THRESHOLD = None
     DOWN_THRESHOLD = None
 
-    status_text = "Calibrating... Stand still (2s)"
+    status_text = "Calibrating. Stand still (2s)"
 
     while True:
         ret, frame = cap.read()
@@ -131,14 +127,11 @@ def main():
             lm = results.pose_landmarks.landmark
             lh = lm[mp_pose.PoseLandmark.LEFT_HIP]
             rh = lm[mp_pose.PoseLandmark.RIGHT_HIP]
-
-            # استخدم visibility لتكون أكثر ثبات
             if lh.visibility > 0.5 and rh.visibility > 0.5:
                 hip_y = float((lh.y + rh.y) / 2.0)
 
         now = time.time()
 
-        # ===== عرض النتيجة لفترة ثم إعادة ضبط =====
         if last_result is not None and (now - last_result_time) < RESULT_HOLD_SEC:
             label = last_result["label"]
             conf = last_result["conf"]
@@ -155,7 +148,6 @@ def main():
                 break
             continue
         else:
-            # انتهى عرض النتيجة -> جهز لعدة جديدة
             if last_result is not None:
                 last_result = None
                 state = "READY"
@@ -164,21 +156,19 @@ def main():
                 went_up = False
                 status_text = "Ready: Do ONE squat rep (Down -> Up)"
 
-        # ===== لو ما في Pose واضح =====
         if hip_y is None:
-            status_text = "No pose detected... Step back (hips+knees visible)"
-        # debug: hip_y
+            status_text = "No pose detected. Step back (hips+knees visible)"
+
         if hip_y is not None:
             cv2.putText(frame, f"hip_y={hip_y:.3f}", (35, 140),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
-        # ===== Calibration =====
         if state == "CALIBRATING":
             if hip_y is not None:
                 calib_hips.append(hip_y)
 
             elapsed = now - calib_start
-            status_text = f"Calibrating... Stand still ({max(0, CALIB_SECONDS-elapsed):.1f}s)"
+            status_text = f"Calibrating. Stand still ({max(0, CALIB_SECONDS-elapsed):.1f}s)"
 
             if elapsed >= CALIB_SECONDS and len(calib_hips) >= CALIB_MIN_SAMPLES:
                 stand_hip = float(np.median(calib_hips))
@@ -189,26 +179,20 @@ def main():
                 status_text = "Ready: Do ONE squat rep (Down -> Up)"
                 print(f"✅ Calibration done. stand_hip={stand_hip:.3f}, UP<{UP_THRESHOLD:.3f}, DOWN>{DOWN_THRESHOLD:.3f}")
 
-        # ===== Rep detection (Threshold Crossing) =====
         if state in ["READY", "RECORDING"] and hip_y is not None and UP_THRESHOLD is not None and DOWN_THRESHOLD is not None:
-            # حركة النزول
             if hip_y > DOWN_THRESHOLD:
                 went_down = True
                 state = "RECORDING"
 
-            # سجل الفريمات فقط أثناء التسجيل
             if state == "RECORDING":
                 rep_frames_rgb.append(rgb)
 
-            # حركة الصعود بعد النزول
             if went_down and hip_y < UP_THRESHOLD:
                 went_up = True
 
-            # اكتملت العدة
             if went_down and went_up:
                 state = "DONE"
 
-        # ===== لما تصير DONE -> اعمل تصنيف مرة واحدة =====
         if state == "DONE":
             sampled = sample_uniform(rep_frames_rgb, NUM_FRAMES)
 
@@ -242,10 +226,8 @@ def main():
                 last_result = {"label": label, "conf": confv}
                 last_result_time = time.time()
 
-            # لا تنسى توقف التسجيل (رح ينمسح بعد hold)
             status_text = "Done!"
 
-        # ===== UI =====
         cv2.rectangle(frame, (20, 20), (980, 120), (0, 0, 0), -1)
         cv2.putText(frame, status_text, (35, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
