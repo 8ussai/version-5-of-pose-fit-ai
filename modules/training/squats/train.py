@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import modules.config as config
-from modules.training.squats.dataset import SquatDataset
+from modules.training.squats.dataset_preprocessed import SquatDatasetPreprocessed
 from modules.training.squats.model import TwoStreamSquatClassifier
 
 
@@ -63,52 +63,66 @@ class SquatTrainer:
 
     def _setup_datasets(self):
         """Setup train and validation datasets"""
-        full_dataset = SquatDataset(
-            root_dir=config.DATA_DIR,
+        # Use preprocessed data directory
+        processed_dir = config.DATA_DIR.parent / "squats_processed"
+        
+        if not processed_dir.exists():
+            raise FileNotFoundError(
+                f"\n❌ Preprocessed data not found at: {processed_dir}\n"
+                f"Please run first: python modules/training/squats/preprocess_videos.py\n"
+            )
+        
+        print(f"\n📂 Loading from: {processed_dir}")
+        
+        # Load training dataset
+        train_dataset = SquatDatasetPreprocessed(
+            processed_dir=processed_dir,
             hyperparams=self.hp,
             split='train'
         )
 
         # Deterministic split
         g = torch.Generator().manual_seed(config.SEED)
-        train_size = int(config.TRAIN_SPLIT * len(full_dataset))
-        val_size = len(full_dataset) - train_size
+        train_size = int(config.TRAIN_SPLIT * len(train_dataset))
+        val_size = len(train_dataset) - train_size
 
-        train_ds, val_ds = random_split(
-            full_dataset, [train_size, val_size], generator=g
+        train_ds, _ = random_split(
+            train_dataset, [train_size, val_size], generator=g
         )
 
-        # Update val dataset to use val transforms (no augmentation)
-        val_dataset_proper = SquatDataset(
-            root_dir=config.DATA_DIR,
+        # Load validation dataset (no augmentation)
+        val_dataset = SquatDatasetPreprocessed(
+            processed_dir=processed_dir,
             hyperparams=self.hp,
             split='val'
         )
-        # Copy the indices from val_ds
-        val_dataset_proper.video_paths = [full_dataset.video_paths[i] for i in val_ds.indices]
-        val_dataset_proper.labels = [full_dataset.labels[i] for i in val_ds.indices]
+        
+        # Use same split indices for validation
+        _, val_ds = random_split(
+            val_dataset, [train_size, val_size], generator=g
+        )
 
         print(f"\n📊 Dataset Split:")
         print(f"   Train: {len(train_ds)} samples")
-        print(f"   Val:   {len(val_dataset_proper)} samples")
+        print(f"   Val:   {len(val_ds)} samples")
 
-        # Setup data loaders
-        num_workers = 2 if self.device.type == "cuda" else 0
-        
+        # Setup data loaders (num_workers=0 for Windows compatibility)
         self.train_loader = DataLoader(
             train_ds,
             batch_size=self.hp.batch_size,
             shuffle=True,
-            num_workers=num_workers,
-            pin_memory=(self.device.type == "cuda")
+            num_workers=self.hp.num_workers,
+            pin_memory=(self.device.type == "cuda"),
+            persistent_workers=False
         )
 
         self.val_loader = DataLoader(
-            val_dataset_proper,
+            val_ds,
             batch_size=self.hp.batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=(self.device.type == "cuda")
+            num_workers=self.hp.num_workers,
+            pin_memory=(self.device.type == "cuda"),
+            persistent_workers=False
         )
 
     def _setup_training(self):
@@ -305,20 +319,15 @@ class SquatTrainer:
 
 def main():
     """Main entry point"""
-    # You can customize hyperparameters here
-    hp = config.SQUAT_HP  # Use default
-    
-    # Or create custom hyperparameters:
-    # from modules.config import SquatHyperparameters
-    # hp = SquatHyperparameters(
-    #     batch_size=8,
-    #     num_epochs=50,
-    #     learning_rate=0.0005,
-    # )
+    hp = config.SQUAT_HP
     
     trainer = SquatTrainer(hyperparams=hp)
     trainer.train()
 
 
 if __name__ == '__main__':
+    # Required for Windows multiprocessing
+    import multiprocessing
+    multiprocessing.freeze_support()
+    
     main()

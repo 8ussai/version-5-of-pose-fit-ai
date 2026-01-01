@@ -1,69 +1,46 @@
-import os
-import cv2
+"""
+Dataset that loads pre-processed videos (avoids MediaPipe during training)
+"""
+
 import torch
 import numpy as np
-import mediapipe as mp
 from torch.utils.data import Dataset
 from torchvision import transforms
+from pathlib import Path
 
 
-class SquatDataset(Dataset):
+class SquatDatasetPreprocessed(Dataset):
     """
-    Two-stream dataset:
-      - original frames (RGB)
-      - mediapipe annotated frames (RGB + pose landmarks drawn)
-    Folder structure (root_dir):
-      root_dir/
-        correct/
-        fast/
-        uncomplete/
-        wrong_position/
+    Dataset that loads pre-processed video frames from .npz files.
+    This avoids MediaPipe initialization issues during training.
     """
 
-    def __init__(self, root_dir, hyperparams, split='train'):
+    def __init__(self, processed_dir, hyperparams, split='train'):
         """
         Args:
-            root_dir: Path to data directory
+            processed_dir: Path to directory with pre-processed .npz files
             hyperparams: SquatHyperparameters instance
             split: 'train' or 'val' (affects augmentation)
         """
-        self.root_dir = str(root_dir)
+        self.processed_dir = Path(processed_dir)
         self.hp = hyperparams
         self.split = split
 
-        self.classes = self.hp.class_names
-        self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+        # Find all .npz files
+        self.npz_files = list(self.processed_dir.glob("*.npz"))
+        
+        if len(self.npz_files) == 0:
+            raise ValueError(f"No .npz files found in {processed_dir}")
 
-        self.video_paths = []
-        self.labels = []
+        print(f"📂 Found {len(self.npz_files)} pre-processed videos")
 
-        for cls in self.classes:
-            cls_dir = os.path.join(self.root_dir, cls)
-            if not os.path.exists(cls_dir):
-                continue
-            for name in os.listdir(cls_dir):
-                if name.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-                    self.video_paths.append(os.path.join(cls_dir, name))
-                    self.labels.append(self.class_to_idx[cls])
-
-        # MediaPipe setup
-        self.mp_pose = mp.solutions.pose
-        self.mp_draw = mp.solutions.drawing_utils
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=self.hp.mp_model_complexity,
-            min_detection_confidence=self.hp.mp_min_detection_confidence,
-            min_tracking_confidence=self.hp.mp_min_tracking_confidence
-        )
-
-        # Transforms
+        # Setup transforms
         self._setup_transforms()
 
     def _setup_transforms(self):
         """Setup different transforms for train/val"""
         base_transforms = [
             transforms.ToPILImage(),
-            transforms.Resize((self.hp.img_size, self.hp.img_size)),
         ]
         
         # Add augmentation for training only
@@ -76,8 +53,9 @@ class SquatDataset(Dataset):
                 ),
             ])
         
-        # Add normalization
+        # Resize and normalize
         base_transforms.extend([
+            transforms.Resize((self.hp.img_size, self.hp.img_size)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -88,70 +66,33 @@ class SquatDataset(Dataset):
         self.transform = transforms.Compose(base_transforms)
 
     def __len__(self):
-        return len(self.video_paths)
-
-    def extract_frames(self, video_path):
-        """Extract uniformly sampled frames from video"""
-        cap = cv2.VideoCapture(video_path)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if total <= 0:
-            cap.release()
-            return []
-
-        idxs = np.linspace(0, total - 1, self.hp.num_frames).astype(int)
-        frames = []
-
-        for idx in idxs:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        cap.release()
-        return frames
-
-    def apply_mediapipe(self, frame_rgb):
-        """Apply MediaPipe pose detection and draw landmarks"""
-        res = self.pose.process(frame_rgb)
-        out = frame_rgb.copy()
-        if res.pose_landmarks:
-            self.mp_draw.draw_landmarks(
-                out,
-                res.pose_landmarks,
-                self.mp_pose.POSE_CONNECTIONS
-            )
-        return out
+        return len(self.npz_files)
 
     def __getitem__(self, idx):
-        video_path = self.video_paths[idx]
-        label = self.labels[idx]
-
-        frames = self.extract_frames(video_path)
-
-        # FIXED: Instead of returning zeros, try next sample
-        if len(frames) == 0:
-            print(f"⚠️  Warning: Empty video at {video_path}, trying next sample")
-            return self.__getitem__((idx + 1) % len(self))
-
-        original_stream = []
-        mediapipe_stream = []
-
-        for fr in frames:
-            original_stream.append(self.transform(fr))
-            mp_fr = self.apply_mediapipe(fr)
-            mediapipe_stream.append(self.transform(mp_fr))
-
-        return {
-            "original": torch.stack(original_stream),   # (T, C, H, W)
-            "mediapipe": torch.stack(mediapipe_stream), # (T, C, H, W)
-            "label": torch.tensor(label, dtype=torch.long)
-        }
-
-    def __del__(self):
-        """Clean up MediaPipe resources"""
+        npz_path = self.npz_files[idx]
+        
         try:
-            if hasattr(self, "pose") and self.pose is not None:
-                self.pose.close()
-        except Exception:
-            pass
+            # Load pre-processed data
+            data = np.load(npz_path)
+            original_frames = data['original']      # (T, H, W, C)
+            mediapipe_frames = data['mediapipe']    # (T, H, W, C)
+            label = int(data['label'])
+            
+            # Apply transforms to each frame
+            original_stream = []
+            mediapipe_stream = []
+            
+            for i in range(len(original_frames)):
+                original_stream.append(self.transform(original_frames[i]))
+                mediapipe_stream.append(self.transform(mediapipe_frames[i]))
+            
+            return {
+                "original": torch.stack(original_stream),    # (T, C, H, W)
+                "mediapipe": torch.stack(mediapipe_stream),  # (T, C, H, W)
+                "label": torch.tensor(label, dtype=torch.long)
+            }
+            
+        except Exception as e:
+            print(f"⚠️  Error loading {npz_path}: {e}")
+            # Return next sample
+            return self.__getitem__((idx + 1) % len(self))

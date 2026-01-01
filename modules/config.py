@@ -1,6 +1,7 @@
 from pathlib import Path
 from dataclasses import dataclass
 import torch
+import platform
 
 
 # ============================================
@@ -48,6 +49,7 @@ class SquatHyperparameters:
     num_epochs: int = 65
     learning_rate: float = 0.001
     weight_decay: float = 1e-5
+    num_workers: int = 0  # Set to 0 for Windows compatibility
     
     # -------- Model Architecture --------
     dropout: float = 0.5
@@ -92,7 +94,7 @@ class SquatHyperparameters:
             self.colors = {
                 "correct": (0, 255, 0),           # Green
                 "fast": (0, 255, 255),            # Yellow
-                "uncomplete": (0, 165, 255),      # Orange
+                "incomplete": (0, 165, 255),      # Orange
                 "wrong_position": (0, 0, 255),    # Red
             }
     
