@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 import modules.config as config 
 from dataset import SquatNPZDataset
-from model import TwoStreamMobileNetGRU
+from modules.training.squats.model import TwoStreamMobileNetGRU
 
 
 @torch.no_grad()
