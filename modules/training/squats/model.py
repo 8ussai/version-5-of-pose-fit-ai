@@ -3,104 +3,72 @@ import torch.nn as nn
 import torchvision.models as models
 
 
-class TwoStreamSquatClassifier(nn.Module):
+class TwoStreamMobileNetGRU(nn.Module):
     """
-    Two-stream model:
-      - spatial stream: ResNet18 -> 512 features per frame
-      - pose stream:    ResNet18 -> 512 features per frame
-      - temporal: BiLSTM on each stream
-      - fusion: concat last-step features -> MLP classifier
+    Lightweight two-stream:
+      - original frames -> MobileNetV2 features (1280)
+      - mediapipe frames -> MobileNetV2 features (1280)
+      - concat -> GRU
+      - classifier
     """
 
-    def __init__(self, hyperparams):
-        """
-        Args:
-            hyperparams: SquatHyperparameters instance
-        """
+    def __init__(self, num_classes=4, hidden=256, layers=1, dropout=0.3, freeze_backbone=True):
         super().__init__()
-        
-        self.hp = hyperparams
 
-        # CNN branches
-        self.spatial_stream = self._create_cnn_branch()
-        self.pose_stream = self._create_cnn_branch()
+        weights = models.MobileNet_V2_Weights.DEFAULT
+        m1 = models.mobilenet_v2(weights=weights)
+        m2 = models.mobilenet_v2(weights=weights)
 
-        # Temporal modules
-        self.temporal_spatial = nn.LSTM(
-            input_size=512,
-            hidden_size=self.hp.lstm_hidden_size,
-            num_layers=self.hp.lstm_num_layers,
+        self.spatial = m1.features
+        self.pose = m2.features
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        feat_dim = 1280
+
+        if freeze_backbone:
+            for p in self.spatial.parameters():
+                p.requires_grad = False
+            for p in self.pose.parameters():
+                p.requires_grad = False
+
+        self.temporal = nn.GRU(
+            input_size=feat_dim * 2,
+            hidden_size=hidden,
+            num_layers=layers,
             batch_first=True,
-            dropout=self.hp.dropout if self.hp.lstm_num_layers > 1 else 0,
-            bidirectional=self.hp.lstm_bidirectional
+            dropout=dropout if layers > 1 else 0.0,
         )
 
-        self.temporal_pose = nn.LSTM(
-            input_size=512,
-            hidden_size=self.hp.lstm_hidden_size,
-            num_layers=self.hp.lstm_num_layers,
-            batch_first=True,
-            dropout=self.hp.dropout if self.hp.lstm_num_layers > 1 else 0,
-            bidirectional=self.hp.lstm_bidirectional
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes),
         )
-
-        # Fusion layer (simplified to reduce overfitting)
-        fusion_input_size = self.hp.get_fusion_input_size()
-        
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_size, 256),
-            nn.ReLU(),
-            nn.Dropout(self.hp.dropout),
-            nn.Linear(256, self.hp.num_classes)
-        )
-
-    def _create_cnn_branch(self):
-        """Create ResNet18 feature extractor"""
-        try:
-            weights = models.ResNet18_Weights.DEFAULT
-            resnet = models.resnet18(weights=weights)
-        except Exception:
-            resnet = models.resnet18(pretrained=True)
-
-        # Remove fc layer; output becomes (B, 512, 1, 1)
-        layers = list(resnet.children())[:-1]
-        return nn.Sequential(*layers)
 
     def forward(self, original_frames, mediapipe_frames):
-        """
-        Args:
-            original_frames:  (B, T, C, H, W)
-            mediapipe_frames: (B, T, C, H, W)
-        
-        Returns:
-            logits: (B, num_classes)
-        """
-        b, t, c, h, w = original_frames.shape
+        # original_frames: (B,T,C,H,W)
+        B, T, C, H, W = original_frames.shape
 
-        # Spatial stream
-        x = original_frames.view(b * t, c, h, w)
-        spatial_feat = self.spatial_stream(x).squeeze(-1).squeeze(-1)  # (B*T, 512)
-        spatial_feat = spatial_feat.view(b, t, 512)                    # (B, T, 512)
+        x1 = original_frames.view(B * T, C, H, W)
+        x2 = mediapipe_frames.view(B * T, C, H, W)
 
-        # Pose stream
-        y = mediapipe_frames.view(b * t, c, h, w)
-        pose_feat = self.pose_stream(y).squeeze(-1).squeeze(-1)        # (B*T, 512)
-        pose_feat = pose_feat.view(b, t, 512)                          # (B, T, 512)
+        f1 = self.spatial(x1)                  # (B*T,1280,7,7)
+        f1 = self.gap(f1).flatten(1)           # (B*T,1280)
 
-        # Temporal processing
-        spatial_out, _ = self.temporal_spatial(spatial_feat)  # (B, T, hidden*directions)
-        pose_out, _ = self.temporal_pose(pose_feat)
+        f2 = self.pose(x2)
+        f2 = self.gap(f2).flatten(1)           # (B*T,1280)
 
-        # Take last timestep
-        spatial_last = spatial_out[:, -1, :]  # (B, hidden*directions)
-        pose_last = pose_out[:, -1, :]        # (B, hidden*directions)
+        fused = torch.cat([f1, f2], dim=1)     # (B*T,2560)
+        fused = fused.view(B, T, -1)           # (B,T,2560)
 
-        # Fusion
-        fused = torch.cat([spatial_last, pose_last], dim=1)
-        logits = self.fusion(fused)
-        
-        return logits
-    
-    def get_num_params(self):
-        """Count trainable parameters"""
+        out, _ = self.temporal(fused)          # (B,T,H)
+        last = out[:, -1, :]                   # (B,H)
+
+        return self.classifier(last)
+
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+    def num_trainable_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
